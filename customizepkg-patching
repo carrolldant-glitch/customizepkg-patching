@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Downstream safety repair: Danny <carrolldant@gmail.com>
 ver=20
 #-----------------------------------------------------------------------#
 #
@@ -25,199 +27,201 @@ ver=20
 #   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 #
 #-----------------------------------------------------------------------#
-
-
-
-#-----------------------------------------------------------------------#
-## Some help ...
-#-----------------------------------------------------------------------#
 print_usage()
 {
-  echo "customizepkg - patching version $ver"
-  echo
-  echo "Without any option, this script reads files from the current directory and shows a diff"
-  echo "between the original and the customized version of the files."
-  echo "The patch to apply the changes is read from /etc/customizepkg.d/\$pkgname"
-  echo
-  echo "usage: customizepkg <option>"
-  echo
-  echo "customizepkg --version, -V       Shows version"
-  echo "customizepkg --help, -h          Shows this help"
-  echo "customizepkg --edit, -e          Edit files marked for customization"
-  echo "                                 (add -v to edit with vimdiff)"
-  echo "customizepkg --patch, -p         Review patch (add -m to save)"
-  echo "customizepkg --modify, -m        Apply the saved modifications"
-  echo "customizepkg --vimdiff, -v       Show diff using vimdiff"
-  echo
-  echo "To customize a file, use:"
-  echo "$ cp file file.original"
-  echo "then edit file."
-  echo
-  echo "To add a file, create and edit it, then use:"
-  echo "$ touch file.original"
-  echo
-  echo "To remove a file, use:"
-  echo "$ mv file file.original"
-  echo
-  echo "Written by Daniel Oertwig <Daniel.Oertwig@googlemail.com>"
-  echo "      homepage: http://www.proggen.org"
-  echo " as a modification of the original customizepkg from"
-  echo " <wain@archlinux.fr>"
-  echo "  homepage: http://archlinux.fr"
-  echo
+  print_version
+  cat <<'USAGE'
+Usage: customizepkg [OPTION ...]
+  -h, --help       Show this help
+  -V, --version    Show version
+  -e, --edit       Edit file.original / file pairs (optionally with -v)
+  -p, --patch      Print a unified patch from those pairs; add -m to save it
+  -m, --modify     Apply the saved patch, retaining new .original backups
+  -v, --vimdiff    View staged changes using read-only Vim; with -e, edit pairs
+
+With no options, preview a saved patch in a private copy, not in place.
+Patches live in ${CUSTOMIZEPKG_DIR:-/etc/customizepkg.d}/PACKAGE.
+PACKAGE is pkgbase, or the first pkgname when pkgbase is absent.
+The PKGBUILD is sourced in a child shell to obtain this name: only use trusted,
+reviewed PKGBUILDs. This program is not a sandbox. Never run it as root.
+
+For a change: copy file to file.original, then edit file.
+For an addition: create file and an empty file.original placeholder.
+For a deletion: move file to file.original.
+Only regular, top-level files are supported; .original and .rej are reserved.
+Input snapshots are limited to 4096 files / 256 MiB; patches to 4 MiB.
+Review or relocate existing backups
+before --modify; they are never intentionally overwritten or auto-deleted.
+Application is not a multi-file transaction: use a disposable checkout, do
+not edit it concurrently, and retain backups if application is interrupted.
+USAGE
 }
-
-
 
 print_version()
 {
-  echo "customizepkg - patching version $ver"
+  printf 'customizepkg - patching version %s (Arch repair 3)\n' "$ver"
 }
 
+die()
+{
+  printf 'customizepkg: %s\n' "$*" >&2
+  exit 1
+}
 
+check_patch_size()
+{
+  local size
+  [[ -s $1 ]] || die 'empty patch; existing configuration is unchanged'
+  size=$(stat -c %s -- "$1") || die 'cannot measure patch'
+  (( size <= 4 * 1024 * 1024 )) || die 'patch exceeds the 4 MiB limit'
+}
 
-#-----------------------------------------------------------------------#
-## MAIN PROGRAMM
-#-----------------------------------------------------------------------#
-shopt -s nullglob
+shopt -s nullglob dotglob
 VIMDIFF=0
 MODIFY=0
 PATCH=0
 EDIT=0
-
-
-
-# Parse commandline options. Modifications are made only
-# if the option -m or --modify are given!
-while [[ "$#" != "0" ]]; do
+while (( $# )); do
   case $1 in
-    -h|--help)
-      print_usage
-      exit 0
-      ;;
-    --version|-V)
-      print_version
-      exit 0
-      ;;
-    -e|--edit)
-      EDIT=1
-      ;;
-    -p|--patch)
-      PATCH=1
-      ;;
-    -m|--modify)
-      MODIFY=1
-      ;;
-    --vimdiff|-v)
-      VIMDIFF=1
-      ;;
+    -h|--help) print_usage; exit 0 ;;
+    -V|--version) print_version; exit 0 ;;
+    -e|--edit) EDIT=1 ;;
+    -p|--patch) PATCH=1 ;;
+    -m|--modify) MODIFY=1 ;;
+    -v|--vimdiff) VIMDIFF=1 ;;
+    *) printf 'customizepkg: unknown option: %s\n' "$1" >&2; exit 2 ;;
   esac
   shift
 done
+(( ! EDIT || (! PATCH && ! MODIFY) )) || die '--edit cannot be combined with --patch or --modify'
+(( ! PATCH || ! VIMDIFF )) || die '--patch cannot be combined with --vimdiff'
+(( EUID != 0 )) || die 'run as an ordinary user, never root'
+[[ -f ./PKGBUILD && ! -L ./PKGBUILD && -r ./PKGBUILD ]] || die 'a readable, regular PKGBUILD is required'
 
-
-
-# Ensure the PKGBUILD file is there and read it to
-# get the pkgname variable!
-if [[ ! -r ./PKGBUILD ]]; then
-  echo "PKGBUILD not found!"
-  exit 1
-fi
-source ./PKGBUILD || exit 1
-
-
-
-# Perform an action on each pair of original and
-# changed files.
+# Every caller propagates errors. A diff's status 1 means differences, not failure.
 for_changes_do() {
+  local f current
   for f in ./*.original; do
-    "$@" "$f" "${f%.original}"
+    current=${f%.original}
+    [[ -f $f && ! -L $f && ! -L $current ]] || die 'backup pairs must be regular files, not links'
+    [[ ! -e $current || -f $current ]] || die 'backup pairs must not contain directories or special files'
+    "$@" "$f" "$current" || return
   done
 }
 
+# Invoked indirectly by for_changes_do for both patch generation and previews.
+# shellcheck disable=SC2329
+show_diff() {
+  local status
+  diff -upN -- "$@" && return 0
+  status=$?
+  (( status == 1 ))
+}
 
-
-# Edit customized files, with vimdiff if the VIMDIFF
-# option was given, or with the editor specified by
-# EDITOR (falling back on vi) otherwise.
-if [[ "$EDIT" == "1" ]]; then
-  if [[ "$VIMDIFF" == "1" ]]; then
-    edit="vim -d"
+if (( EDIT )); then
+  if (( VIMDIFF )); then
+    editor=(vim -d --)
   else
-    edit="${EDITOR:-vi}"
+    # Same simple word-list convention as before, without wildcard expansion/eval.
+    read -r -a editor <<< "${EDITOR:-vi}"
+    (( ${#editor[@]} )) || die 'EDITOR must name a command'
   fi
-  for_changes_do $edit
+  for_changes_do "${editor[@]}"
+  exit $?
+fi
+
+workdir=$(mktemp -d -- "${TMPDIR:-/tmp}/customizepkg.XXXXXXXX") || die 'cannot create private staging directory'
+save_tmp=
+trap 'rm -rf -- "$workdir"; if [[ -n $save_tmp ]]; then rm -f -- "$save_tmp"; fi' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Printing a patch or editing pairs does not need to execute the PKGBUILD.
+if (( PATCH )); then
+  for_changes_do show_diff > "$workdir/patch" || die 'cannot generate patch; saved configuration is unchanged'
+  if (( MODIFY )); then check_patch_size "$workdir/patch"; fi
+  cat -- "$workdir/patch" || die 'cannot print patch'
+  (( MODIFY )) || exit 0
+fi
+
+# Keep recipe variables, functions, options and traps out of this process.
+# This is isolation of shell state only: a trusted PKGBUILD can still run commands.
+pkgkey=$(bash --noprofile --norc -c '
+  source ./PKGBUILD >&2 || exit 1
+  printf "%s\n" "${pkgbase:-${pkgname[0]-}}"
+') || die 'cannot read package identity'
+[[ $pkgkey =~ ^[[:alnum:]@_+][[:alnum:]@_.+-]*$ ]] || die 'invalid or missing package identity'
+configdir=$(cd -- "${CUSTOMIZEPKG_DIR:-/etc/customizepkg.d}" && pwd -P) || die 'patch directory is unavailable'
+patch_file=$configdir/$pkgkey
+[[ ! -L $patch_file && ( ! -e $patch_file || -f $patch_file ) ]] || die 'patch configuration must be a regular file, not a link'
+
+if (( PATCH )); then
+  save_tmp=$(mktemp -- "$configdir/.$pkgkey.XXXXXXXX") || die 'cannot stage saved patch; existing configuration is unchanged'
+  cp -- "$workdir/patch" "$save_tmp" || die 'cannot write saved patch'
+  if [[ -f $patch_file ]]; then
+    chmod --reference="$patch_file" -- "$save_tmp" || die 'cannot preserve patch permissions'
+  fi
+  mv -fT -- "$save_tmp" "$patch_file" || die 'cannot replace saved patch'
+  save_tmp=
   exit 0
 fi
 
+[[ -f $patch_file && -r $patch_file && -s $patch_file ]] || die "no nonempty patch for $pkgkey in $configdir"
+check_patch_size "$patch_file"
+cp -- "$patch_file" "$workdir/patch" || die 'cannot snapshot patch'
+check_patch_size "$workdir/patch"
+mkdir -- "$workdir/stage" || die 'cannot create staging workspace'
 
+# ponytail: shallow copies cost O(total bytes), capped at 256 MiB/4096 files.
+# Nested/large trees need a separate isolated workflow, not recursive copying here.
+declare -A existed=()
+total=0
+count=0
+for f in ./*; do
+  case $f in *.original|*.rej) continue ;; esac
+  [[ -f $f && ! -L $f ]] || continue
+  size=$(stat -c %s -- "$f") || die 'cannot measure input'
+  (( total += size, count += 1 ))
+  (( total <= 256 * 1024 * 1024 && count <= 4096 )) || die 'staging limit exceeded (256 MiB / 4096 files)'
+  existed[${f#./}]=1
+done
+cp --reflink=auto --preserve=mode,timestamps -- "${!existed[@]}" "$workdir/stage/" || die 'cannot snapshot input'
 
-# Show a patch with the current modifications.
-# If the MODIFY option was given, also write it to the
-# configdir.
-if [[ "$PATCH" == "1" ]]; then
-  for_changes_do diff -upN |
-    if [[ "$MODIFY" == "1" ]]; then
-      tee "/etc/customizepkg.d/$pkgname"
-    else
-      cat
+patch_args=(--unified --batch --forward --fuzz=0 --strip=0 --get=0
+  --read-only=fail --backup --version-control=simple --suffix=.original
+  --reject-file=- --input="$workdir/patch")
+(cd -- "$workdir/stage" && patch "${patch_args[@]}") || die 'patch rejected in staging; no patch was applied to the working files'
+
+changes=("$workdir/stage/"*.original)
+(( ${#changes[@]} )) || die 'patch made no supported changes'
+for f in "$workdir/stage/"*; do
+  [[ -f $f && ! -L $f ]] || die 'only regular, top-level patch targets are supported'
+done
+for f in "${changes[@]}"; do
+  name=${f##*/}
+  name=${name%.original}
+  case $name in ''|*.original|*.rej) die '.original and .rej names are reserved' ;; esac
+  if [[ ${existed[$name]-} ]]; then
+    if [[ ! -f ./$name || -L ./$name ]] || ! cmp -s -- "$f" "./$name"; then
+      die "input changed or is not regular: $name"
     fi
-  exit 0
+  else
+    [[ ! -e ./$name && ! -L ./$name ]] || die "new target already exists or is not regular: $name"
+  fi
+  if (( MODIFY )); then
+    [[ ! -e ./$name.original && ! -L ./$name.original ]] || die "backup already exists: $name.original"
+  fi
+done
+
+if (( MODIFY )); then
+  # ponytail: preflight + application is not an atomic multi-file transaction.
+  # Concurrent writers/I/O failures need a disposable checkout or FS snapshot.
+  patch "${patch_args[@]}" || die 'application failed; changes may be partial, preserve .original backups for recovery'
 fi
 
-
-
-# Ensure there is a patch available in the configdir!
-if [[ ! -r "/etc/customizepkg.d/$pkgname" ]]; then
-  echo "No configuration for $pkgname in /etc/customizepkg.d"
-  exit 1
-fi
-
-
-
-# Apply the patch. Exit if something goes wrong.
-patch -b -z .original -i "/etc/customizepkg.d/$pkgname"
-if [[ "$?" -gt "1" ]]; then
-  echo "Patching failed!"
-  for f in *.rej; do
-    echo "$f"
-    cat "$f"
-  done
-  exit 1
-fi
-
-
-
-# Show the diffs
-if [[ "$VIMDIFF" == "1" ]]; then
-  for_changes_do vim -d
+if (( VIMDIFF )); then
+  (cd -- "$workdir/stage" && for_changes_do vim -R -n -d --)
 else
-  for_changes_do diff -upN
+  (cd -- "$workdir/stage" && for_changes_do show_diff)
 fi
-
-
-
-# Revert a modification.
-# If the original file is empty, it means that
-# a new file was created by the patch, so remove it.
-revert() {
-  mv -f "$1" "$2"
-  [[ -s "$2" ]] || rm "$2"
-}
-
-
-
-# Only if the MODIFY option was given the 
-# modified file stays. Otherwise, the original
-# file is used.
-if [[ "$MODIFY" == "0" ]]; then
-  for_changes_do revert
-  rm -f *.rej
-fi
-
-
-
-# Exit gracefully :)
-exit 0
-
-
+exit $?

@@ -1,0 +1,6 @@
+/verification/
+/src/
+/pkg/
+/*.pkg.tar.*
+/*.log
+/__pycache__/

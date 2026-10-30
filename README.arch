@@ -1,0 +1,97 @@
+customizepkg-patching 20-3 — local Arch repair
+SPDX-License-Identifier: GPL-2.0-only
+
+Purpose
+-------
+Carry explicitly reviewed patches to PKGBUILDs and their top-level supporting
+files. This is a small patch helper, not a package manager, dependency resolver,
+automatic updater or security sandbox. Installation does not configure Paru,
+Yay, Pacman, sudo or any automatic hook. The installed command is customizepkg.
+
+Trust and scope
+---------------
+Run only as an ordinary user in a disposable checkout containing a PKGBUILD
+you have already reviewed and trust. Reading the package identity SOURCES that
+PKGBUILD in a child Bash process. The child protects the helper's shell state,
+not your filesystem, network or credentials: arbitrary top-level commands in
+the recipe can still run with your user's authority. Printing --patch, editing
+pairs, --help and --version do not source the recipe.
+
+The helper's patch preview works in a private temporary copy, not by modifying
+and reverting the working files. --modify first validates the same saved patch
+there, then checks affected inputs and backup destinations before applying it
+to the working directory. Rejected hunks stop before that application. Existing
+.original backups and unrelated .rej files are not automatically removed.
+
+This is NOT a multi-file transaction. Concurrent writers, power loss, signals,
+storage exhaustion or I/O failures during real application can leave partial
+changes. A nonzero result is not a rollback guarantee. Keep the checkout and
+new .original backups for manual inspection/recovery; never retry blindly.
+Do not run two instances against the same checkout or patch configuration.
+
+Compatibility and deliberate limits
+------------------------------------
+- Only unified patches for regular, top-level files are supported. Subdirectories,
+  symlink targets, special files and targets ending in .original or .rej are
+  rejected. Generated patches use the familiar file.original / file convention.
+- The input snapshot is bounded to 4096 regular files and 256 MiB; saved patches
+  to 4 MiB. Extra space is needed for staged changes/backups. Large archives in
+  the checkout count toward the input limit. Use a separate isolated workflow
+  for nested or large source trees instead of increasing limits blindly.
+- GNU patch runs noninteractively, with no fuzzy context matching or automatic
+  reverse application. Supported quoting is delegated to GNU diff/patch, never
+  eval. Some GNU patch versions reject embedded-newline filenames; such failures
+  remain in staging, with no helper-applied changes to working files.
+- Patch identity is pkgbase when supplied, otherwise the first pkgname. Split
+  packages therefore use the base's patch, not one silently selected subpackage.
+- Unknown options and conflicting modes fail. --modify retains newly generated
+  .original backups and refuses to overwrite an existing affected backup.
+- --vimdiff shows the private staged pairs with Vim's read-only flag. --edit
+  intentionally edits real pairs. EDITOR is a simple whitespace-separated
+  command/argument list, not shell syntax; use a wrapper for complex commands.
+
+Patch directory and commands
+----------------------------
+Default: /etc/customizepkg.d/PACKAGE. No files are written there automatically.
+For rootless use, create a directory you own and set CUSTOMIZEPKG_DIR to it.
+Example, after preparing a local patches/ directory:
+
+  CUSTOMIZEPKG_DIR="$PWD/patches" customizepkg
+  CUSTOMIZEPKG_DIR="$PWD/patches" customizepkg --modify
+
+To prepare a change, copy file to file.original and edit file. To add a file,
+create file and an empty file.original placeholder. To delete one, move file
+to file.original. Then:
+
+  customizepkg --patch
+  CUSTOMIZEPKG_DIR="$PWD/patches" customizepkg --patch --modify
+
+Saving uses a temporary file in the chosen patch directory and a rename;
+generation/write failures leave the prior patch in place. Empty/no-change
+saves are rejected. New saved patches are private (0600); replacements preserve
+the existing file mode. Symlink configurations are refused. Move completed
+draft pairs/backups aside deliberately before applying the saved patch to a
+fresh checkout. Never run the helper with sudo to make a save succeed.
+
+Verification and provenance
+---------------------------
+check.py is a standard-library-only offline regression check. From the reviewed
+source directory, as an ordinary user:
+
+  bash -n customizepkg-patching
+  shellcheck customizepkg-patching
+  python check.py ./customizepkg-patching
+
+All test files are synthetic and disposable. Python and ShellCheck are check
+dependencies only, not runtime requirements. Rootless host-library tests are
+not clean-chroot results; see the source repository's changes.md for the current
+review/build evidence.
+
+The original AUR source is from commit
+2fd4c24d99ccef3781694521f2ac63d0c3dd44a3 (20-2). AUTHORS and COPYING are unchanged
+copies from musteresel/customizepkg-patching commit
+125518163db775c42124200f26946a9f9849fffd. AUTHORS explicitly grants GPL version 2.
+Original upstream/packager attribution is preserved; Danny is a Contributor,
+not a claimed AUR maintainer. Package release 3 identifies this downstream
+repair, not a new upstream release. No installation or publication is implied
+by the presence of these files.
